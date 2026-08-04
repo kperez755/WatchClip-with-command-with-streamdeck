@@ -13,10 +13,12 @@
  *  - Self-contained Twitch OAuth flow (no third-party token generator needed)
  *
  * Auth model: every install authorizes through one shared Twitch application
- * (Public client type, Authorization Code + PKCE — no client secret exists
- * or is needed). This means testers never register their own Twitch dev app;
- * they just run the server, enter their channel name, and click Authorize.
- * Channel name lives in config.json (set via the in-app setup page), not .env.
+ * (Public client type, Device Code Flow — no client secret exists or is
+ * needed, and no redirect URL/HTTPS listener either). This means testers
+ * never register their own Twitch dev app; they just run the server, enter
+ * their channel name, click Authorize, and approve on twitch.tv in any
+ * browser (even their phone). Channel name lives in config.json (set via the
+ * in-app setup page), not .env.
  */
 
 const path = require('path');
@@ -48,13 +50,10 @@ for (const level of ['log', 'warn', 'error']) {
 console.log(`[watchklyp] Logging to ${LOG_PATH}`);
 
 require('dotenv').config({ path: path.join(EXE_DIR, '.env') }); // optional now — fine if the file doesn't exist
-const https = require('https');
-const crypto = require('crypto');
 const { exec } = require('child_process');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const tmi = require('tmi.js');
-const selfsigned = require('selfsigned');
 
 // Shared WatchKlyp Twitch application (Public client — no secret). Every
 // install uses this same Client ID; testers never need their own Twitch dev
@@ -62,12 +61,6 @@ const selfsigned = require('selfsigned');
 const {
   TWITCH_CLIENT_ID = '4qgo5nr361rj7iagxghu4a8fbsgnkb',
   PORT = 3939,
-  // Twitch's console rejects http:// redirect URLs (even for localhost) as of
-  // this writing, so the OAuth callback runs on its own tiny HTTPS listener
-  // with a locally-generated self-signed cert. Everything else (browser
-  // source, Stream Deck endpoint) stays on plain http on PORT.
-  AUTH_PORT = 3940,
-  REDIRECT_URI = `https://localhost:${AUTH_PORT}/auth/twitch/callback`,
 } = process.env;
 
 const TOKEN_PATH = path.join(EXE_DIR, 'token.json');
@@ -109,39 +102,6 @@ function openBrowser(url) {
   exec(cmd, (err) => {
     if (err) console.warn('[watchklyp] Could not auto-open browser:', err.message);
   });
-}
-
-// ---------------------------------------------------------------------------
-// Self-signed HTTPS cert for the OAuth callback listener (localhost-only,
-// generated once and cached to disk). The browser will show a "not secure"
-// warning the first time — that's expected for a local dev cert.
-// ---------------------------------------------------------------------------
-const CERT_KEY_PATH = path.join(EXE_DIR, 'certs.key.pem');
-const CERT_CRT_PATH = path.join(EXE_DIR, 'certs.crt.pem');
-
-function getOrCreateCert() {
-  if (fs.existsSync(CERT_KEY_PATH) && fs.existsSync(CERT_CRT_PATH)) {
-    return {
-      key: fs.readFileSync(CERT_KEY_PATH, 'utf8'),
-      cert: fs.readFileSync(CERT_CRT_PATH, 'utf8'),
-    };
-  }
-  const pems = selfsigned.generate([{ name: 'commonName', value: 'localhost' }], {
-    days: 3650,
-    keySize: 2048,
-    extensions: [
-      {
-        name: 'subjectAltName',
-        altNames: [
-          { type: 2, value: 'localhost' },
-          { type: 7, ip: '127.0.0.1' },
-        ],
-      },
-    ],
-  });
-  fs.writeFileSync(CERT_KEY_PATH, pems.private);
-  fs.writeFileSync(CERT_CRT_PATH, pems.cert);
-  return { key: pems.private, cert: pems.cert };
 }
 
 // ---------------------------------------------------------------------------
@@ -502,24 +462,97 @@ async function refreshUserToken(refreshToken) {
 }
 
 // ---------------------------------------------------------------------------
-// PKCE (Proof Key for Code Exchange) — replaces the client-secret step of
-// the OAuth flow for Public-client apps. We generate a random "verifier",
-// send its hashed "challenge" with the authorize request, then prove we're
-// the same instance that started the flow by sending the raw verifier back
-// when exchanging the code for a token — no secret required or possible.
+// Device Code Flow — the auth flow Twitch actually supports for Public
+// clients with no secret (their Authorization Code grant always requires a
+// client_secret, confidential or not — confirmed against Twitch's own docs).
+// No redirect URL or local HTTPS listener needed at all: we ask Twitch for a
+// device_code + a short user_code, show the user a link to approve it on
+// twitch.tv (in any browser, even their phone), and poll in the background
+// until they do. Docs: https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#device-code-grant-flow
 // ---------------------------------------------------------------------------
-function base64url(buffer) {
-  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function generatePkcePair() {
-  const verifier = base64url(crypto.randomBytes(32));
-  const challenge = base64url(crypto.createHash('sha256').update(verifier).digest());
-  return { verifier, challenge };
-}
+const AUTH_SCOPES = 'chat:read chat:edit channel:manage:clips';
 
 // Single in-flight auth attempt at a time — fine for a local single-user app.
-let pendingAuth = null; // { verifier, state }
+// { device_code, user_code, verification_uri, expiresAt, interval, status, error }
+let deviceAuth = null;
+
+async function startDeviceAuth() {
+  const form = new FormData();
+  form.append('client_id', TWITCH_CLIENT_ID);
+  form.append('scopes', AUTH_SCOPES);
+  const res = await fetch('https://id.twitch.tv/oauth2/device', { method: 'POST', body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.device_code) {
+    throw new Error(data.message || `Failed to start device auth (${res.status})`);
+  }
+  deviceAuth = {
+    device_code: data.device_code,
+    user_code: data.user_code,
+    verification_uri: data.verification_uri,
+    expiresAt: Date.now() + (data.expires_in || 1800) * 1000,
+    interval: Math.max(data.interval || 5, 2) * 1000,
+    status: 'pending',
+    error: null,
+  };
+  pollDeviceAuth(deviceAuth);
+  return deviceAuth;
+}
+
+// Polls in the background — not tied to any single HTTP request, since the
+// user might take anywhere from a few seconds to a couple minutes to
+// actually click through on Twitch. The frontend checks in on progress via
+// GET /auth/twitch/poll rather than holding a request open.
+async function pollDeviceAuth(session) {
+  if (deviceAuth !== session || session.status !== 'pending') return; // superseded or already resolved
+  if (Date.now() > session.expiresAt) {
+    session.status = 'expired';
+    return;
+  }
+  try {
+    const form = new FormData();
+    form.append('client_id', TWITCH_CLIENT_ID);
+    form.append('scopes', AUTH_SCOPES);
+    form.append('device_code', session.device_code);
+    form.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
+    const res = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', body: form });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok && data.access_token) {
+      saveToken({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        obtained_at: Date.now(),
+      });
+      session.status = 'authorized';
+      console.log('[watchklyp] Authorized via Twitch.');
+      await startChatBot();
+      return;
+    }
+
+    if (data.message === 'authorization_pending') {
+      setTimeout(() => pollDeviceAuth(session), session.interval);
+      return;
+    }
+    if (data.message === 'slow_down' || res.status === 429) {
+      session.interval += 2000;
+      setTimeout(() => pollDeviceAuth(session), session.interval);
+      return;
+    }
+    if (data.message === 'invalid device code') {
+      session.status = 'expired';
+      return;
+    }
+
+    // Anything else unrecognized — surface it and stop rather than loop forever.
+    session.status = 'error';
+    session.error = data.message || `Unexpected response (${res.status})`;
+    console.error('[watchklyp] Device auth error:', session.error);
+  } catch (err) {
+    session.status = 'error';
+    session.error = err.message;
+    console.error('[watchklyp] Device auth poll failed:', err.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Chat bot (tmi.js) — connects once we have a user token, listens for !watch
@@ -784,9 +817,8 @@ app.get('/status', async (req, res) => {
   let authBadge, authBody;
   if (!token) {
     authBadge = `<span class="badge badge-warning"><span class="dot"></span>Not authorized</span>`;
-    authBody = `<p>Connect your Twitch account to start the chat bot and enable
-      chrome-less playback. Your browser will warn about the local cert on the
-      callback page — that's expected, click through it.</p>
+    authBody = `<p>Connect your Twitch account to start the chat bot and
+      enable chrome-less playback.</p>
       <a class="btn" href="/auth/twitch">Authorize with Twitch →</a>`;
   } else if (hasClipScope) {
     authBadge = `<span class="badge badge-success"><span class="dot"></span>Authorized</span>`;
@@ -875,82 +907,49 @@ app.get('/api/cycle/next', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/auth/twitch', (req, res) => {
-  const { verifier, challenge } = generatePkcePair();
-  const state = base64url(crypto.randomBytes(16));
-  pendingAuth = { verifier, state };
-
-  const params = new URLSearchParams({
-    client_id: TWITCH_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
-    response_type: 'code',
-    // chat:read/chat:edit for the !watch bot, channel:manage:clips so the
-    // browser source can play a chrome-less <video> via Get Clips Download
-    // instead of Twitch's iframe embed.
-    scope: 'chat:read chat:edit channel:manage:clips',
-    // Without this, Twitch can silently reuse a prior authorization and skip
-    // the consent screen — which means a token that's missing the newly
-    // added channel:manage:clips scope. Force the prompt every time.
-    force_verify: 'true',
-    code_challenge: challenge,
-    code_challenge_method: 'S256',
-    state,
-  });
-  res.redirect(`https://id.twitch.tv/oauth2/authorize?${params}`);
-});
-
-app.get('/auth/twitch/callback', async (req, res) => {
-  const { code, error, error_description, state } = req.query;
-  if (error) {
-    return res.status(400).type('html').send(renderPage('Auth error', `
-      <h1>Twitch auth error</h1>
-      <p class="lead">${escapeHtml(error_description || error)}</p>
-      <a class="btn" href="/auth/twitch">Try again →</a>
-    `));
-  }
-  if (!pendingAuth || state !== pendingAuth.state) {
-    return res.status(400).type('html').send(renderPage('Auth error', `
-      <h1>Auth session expired</h1>
-      <p class="lead">This link doesn't match your current session — go back and click Authorize again.</p>
-      <a class="btn" href="/auth/twitch">Try again →</a>
-    `));
-  }
-  const { verifier } = pendingAuth;
-  pendingAuth = null;
+app.get('/auth/twitch', async (req, res) => {
   try {
-    const tokenRes = await fetch('https://id.twitch.tv/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: TWITCH_CLIENT_ID,
-        code,
-        grant_type: 'authorization_code',
-        redirect_uri: REDIRECT_URI,
-        code_verifier: verifier,
-      }),
-    });
-    if (!tokenRes.ok) throw new Error(await tokenRes.text());
-    const data = await tokenRes.json();
-    saveToken({
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-      obtained_at: Date.now(),
-    });
-    await startChatBot();
-    res.type('html').send(renderPage('Authorized', `
-      <span class="badge badge-success"><span class="dot"></span>Authorized</span>
-      <h1>You're all set</h1>
-      <p class="lead">The chat bot is connecting now. You can close this tab and go back to Twitch chat.</p>
-      <a class="btn btn-ghost" href="/status">Back to status →</a>
+    if (!deviceAuth || deviceAuth.status !== 'pending') {
+      await startDeviceAuth();
+    }
+    res.type('html').send(renderPage('Authorize', `
+      <h1>Authorize on Twitch</h1>
+      <p class="lead">Open this link and log in — it's already filled in, no
+      code to type. You can do this from your phone if that's easier.</p>
+      <a class="btn" href="${escapeHtml(deviceAuth.verification_uri)}" target="_blank" rel="noopener">Continue on Twitch →</a>
+      <p style="margin-top:18px">If that link doesn't work, go to
+      <a href="https://www.twitch.tv/activate" target="_blank" rel="noopener">twitch.tv/activate</a>
+      and enter this code: <strong>${escapeHtml(deviceAuth.user_code)}</strong></p>
+      <p id="auth-status" style="margin-top:20px">Waiting for you to authorize on Twitch…</p>
+      <script>
+        function checkAuth() {
+          fetch('/auth/twitch/poll').then(function (r) { return r.json(); }).then(function (d) {
+            if (d.status === 'authorized') {
+              window.location.href = '/status';
+            } else if (d.status === 'expired' || d.status === 'error') {
+              document.getElementById('auth-status').textContent =
+                'That link expired or something went wrong. Reload this page to try again.';
+            } else {
+              setTimeout(checkAuth, 2000);
+            }
+          }).catch(function () { setTimeout(checkAuth, 3000); });
+        }
+        checkAuth();
+      </script>
     `));
   } catch (err) {
-    console.error('[watchklyp] OAuth callback error:', err.message);
+    console.error('[watchklyp] Failed to start device auth:', err.message);
     res.status(500).type('html').send(renderPage('Auth error', `
-      <h1>Authorization failed</h1>
+      <h1>Couldn't start authorization</h1>
       <p class="lead">${escapeHtml(err.message)}</p>
       <a class="btn" href="/auth/twitch">Try again →</a>
     `));
   }
+});
+
+app.get('/auth/twitch/poll', (req, res) => {
+  if (!deviceAuth) return res.json({ status: 'none' });
+  res.json({ status: deviceAuth.status, error: deviceAuth.error });
 });
 
 const server = app.listen(PORT, () => {
@@ -978,11 +977,4 @@ setInterval(async () => {
 
 server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-});
-
-// Separate HTTPS listener, used only for the Twitch OAuth callback (Twitch
-// requires an https:// redirect URL). Same Express app, different port.
-const httpsServer = https.createServer(getOrCreateCert(), app);
-httpsServer.listen(AUTH_PORT, () => {
-  console.log(`[watchklyp] HTTPS auth listener on https://localhost:${AUTH_PORT} (OAuth callback only)`);
 });

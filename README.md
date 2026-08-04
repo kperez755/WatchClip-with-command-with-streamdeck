@@ -68,32 +68,28 @@ After saving your channel, you'll land on the status page — click
 your account (or a bot account, see below), plus permission to fetch clip
 video files for chrome-less playback.
 
-1. Log in with the account that should post as the bot (your own account is
-   fine — it only speaks when `!watch` is used).
-2. You'll land on an actual Twitch permissions screen listing the requested
-   scopes — click **Authorize**. You'll then land on
-   `https://localhost:3940/...` and your browser will show a "connection is
-   not private" warning — that's expected, it's the self-signed cert for the
-   local callback listener. Click **Advanced → Proceed to localhost**
-   (Chrome) or the equivalent, and you'll land on a confirmation page. The
-   chat bot connects automatically from then on, including on future
-   restarts (it saves a token locally in `token.json`).
+1. You'll land on a page with a **Continue on Twitch** link and a short
+   code. Click it (or open it on your phone — it works from any device).
+2. Log in with the account that should post as the bot (your own account is
+   fine — it only speaks when `!watch` is used), and approve the request.
+3. That's it — no code to type, nothing to copy. The WatchKlyp tab notices
+   automatically and takes you to the status page once you've approved it on
+   Twitch. The chat bot connects from there, including on future restarts
+   (it saves a token locally in `token.json`).
 
 Want a separate bot account instead of your own? Just log into that account
-in the browser before clicking Authorize.
+before approving the request.
 
 > **Already authorized before, or want a clean slate?** Visit
-> `/auth/twitch` any time to re-authorize — it always shows the permissions
-> screen, even if you'd approved before. You can also manage or fully revoke
-> access from twitch.tv/settings/connections; the status page links there
-> directly, and checks live with Twitch rather than just trusting the local
-> token file.
+> `/auth/twitch` any time to re-authorize. You can also manage or fully
+> revoke access from twitch.tv/settings/connections; the status page links
+> there directly, and checks live with Twitch rather than just trusting the
+> local token file.
 
 > **Running your own Twitch app instead of the shared one?** Set
 > `TWITCH_CLIENT_ID` in `.env` — it must be registered as a **Public**
-> client type (this app uses the PKCE flow and has no secret), with redirect
-> URL `https://localhost:3940/auth/twitch/callback`. Not something most
-> people need to touch.
+> client type (this app uses the device code flow and has no secret). Not
+> something most people need to touch.
 
 ### 4. Add the browser source in Streamlabs OBS
 
@@ -192,11 +188,10 @@ as a universal kill switch if something looks wrong.
 - **Run at Windows startup (optional)**: press `Win+R`, type `shell:startup`,
   and drop a shortcut to `start.bat` in that folder so it launches whenever
   you log in.
-- **Two ports, on purpose**: `3939` (plain http) serves the browser source
-  and Stream Deck endpoints — Streamlabs OBS's embedded browser won't accept
-  a self-signed cert, so this stays on http. `3940` (https, self-signed)
-  exists solely so Twitch will accept the OAuth redirect URL; you only ever
-  touch it once, during the one-time authorize step.
+- **One port, no certs**: everything — browser source, Stream Deck
+  endpoints, setup, and authorization — runs on plain http on `3939`. There's
+  no separate HTTPS listener or self-signed cert to click through, since
+  Twitch's device code flow doesn't use a redirect URL at all.
 
 ## Troubleshooting
 
