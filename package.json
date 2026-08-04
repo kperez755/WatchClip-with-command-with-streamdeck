@@ -1,0 +1,34 @@
+{
+  "name": "watchklyp",
+  "version": "1.0.0",
+  "description": "Local Twitch !watch command + Stream Deck button that pulls the latest clip into a Streamlabs OBS browser source.",
+  "main": "server.js",
+  "bin": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "build:exe": "pkg . --targets node18-win-x64 --output dist/watchklyp.exe"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "selfsigned": "1.10.14",
+    "tmi.js": "^1.8.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^6.22.0"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

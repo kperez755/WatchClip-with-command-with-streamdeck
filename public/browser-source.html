@@ -1,0 +1,206 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>WatchKlyp</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #stage {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
+  #video, #player {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: none;
+    background: transparent;
+    object-fit: contain;
+  }
+  #overlay {
+    position: absolute;
+    left: 16px;
+    bottom: 16px;
+    max-width: calc(100% - 32px);
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 15px;
+    line-height: 1.35;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    pointer-events: none;
+  }
+  #overlay.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  #overlay .title { font-weight: 600; }
+  #overlay .creator { opacity: 0.75; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <!-- Chrome-less native player, used when a direct clip video URL is available -->
+    <video id="video" playsinline autoplay></video>
+    <!-- Fallback: Twitch's iframe embed (used only if the direct video URL isn't available) -->
+    <iframe id="player" allowfullscreen scrolling="no"></iframe>
+    <div id="overlay">
+      <div class="title" id="overlay-title"></div>
+      <div class="creator" id="overlay-creator"></div>
+    </div>
+  </div>
+
+<script>
+  const videoEl = document.getElementById('video');
+  const playerEl = document.getElementById('player');
+  const overlayEl = document.getElementById('overlay');
+  const overlayTitle = document.getElementById('overlay-title');
+  const overlayCreator = document.getElementById('overlay-creator');
+  let overlayTimer = null;
+  let hideTimer = null;
+  let currentData = null;
+
+  function hideAll() {
+    videoEl.pause();
+    videoEl.removeAttribute('src');
+    videoEl.load();
+    videoEl.style.display = 'none';
+    playerEl.src = 'about:blank';
+    playerEl.style.display = 'none';
+    clearTimeout(hideTimer);
+  }
+
+  function showOverlay(data) {
+    overlayTitle.textContent = data.title || '';
+    overlayCreator.textContent = data.creator ? `clipped by ${data.creator}` : '';
+    overlayEl.classList.add('show');
+    clearTimeout(overlayTimer);
+    overlayTimer = setTimeout(() => overlayEl.classList.remove('show'), 6000);
+  }
+
+  function playEmbed(data) {
+    videoEl.pause();
+    videoEl.removeAttribute('src');
+    videoEl.load();
+    videoEl.style.display = 'none';
+
+    playerEl.src = 'about:blank';
+    requestAnimationFrame(() => {
+      playerEl.src = data.embedUrl;
+      playerEl.style.display = 'block';
+    });
+
+    // No cross-origin "ended" event available from the iframe, so hide it
+    // after the clip's known duration instead. Extra buffer accounts for the
+    // embed's own load time (it can take a couple seconds to actually start
+    // playing after we set the src) so it doesn't get cut off early.
+    clearTimeout(hideTimer);
+    const ms = (Number(data.durationSeconds) || 30) * 1000 + 10000;
+    hideTimer = setTimeout(() => {
+      // Mid-cycle: ask the server for the next clip instead of going blank
+      // (this is only a fallback path — cycling clips are almost always
+      // chrome-less <video>, which advances itself via the 'ended' event
+      // below the moment it actually finishes, no guessing needed).
+      if (data.cycling) {
+        fetch('/api/cycle/next').catch(() => {});
+      } else {
+        hideAll();
+      }
+    }, ms);
+  }
+
+  function playVideo(data) {
+    playerEl.src = 'about:blank';
+    playerEl.style.display = 'none';
+
+    videoEl.pause();
+    videoEl.removeAttribute('src');
+    videoEl.load();
+    requestAnimationFrame(() => {
+      videoEl.src = data.videoUrl;
+      videoEl.style.display = 'block';
+      videoEl.play().catch(() => {});
+    });
+  }
+
+  function showClip(data) {
+    currentData = data;
+    clearTimeout(hideTimer);
+    showOverlay(data);
+
+    if (data.videoUrl) {
+      playVideo(data);
+    } else if (data.embedUrl) {
+      playEmbed(data);
+    }
+  }
+
+  videoEl.addEventListener('ended', () => {
+    if (currentData && currentData.cycling) {
+      // Ask the server for the next clip in the cycle right away — this is
+      // the real 'ended' event, so the swap happens at the exact right
+      // moment instead of a guessed timer. If the next clip doesn't arrive
+      // quickly for some reason, don't just sit on a frozen last frame.
+      fetch('/api/cycle/next').catch(() => {});
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(hideAll, 4000);
+    } else {
+      hideAll();
+    }
+  });
+  videoEl.addEventListener('error', () => {
+    // Direct video URL failed to play (wrong format, expired URL, etc). Fall
+    // back to Twitch's iframe embed for this same clip instead of going blank.
+    console.warn('WatchKlyp: direct video failed to play, falling back to embed');
+    if (currentData && currentData.embedUrl) {
+      playEmbed(currentData);
+    } else {
+      hideAll();
+    }
+  });
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}`);
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'clip') {
+          showClip(data);
+        } else if (data.type === 'control' && data.action === 'stop') {
+          hideAll();
+        } else if (data.type === 'control' && data.action === 'toggle-pause') {
+          // Only meaningful for the chrome-less <video> path — the iframe
+          // embed has no external play/pause control at all.
+          if (videoEl.style.display === 'block') {
+            videoEl.paused ? videoEl.play().catch(() => {}) : videoEl.pause();
+          }
+        }
+      } catch (e) {
+        console.error('WatchKlyp: bad message', e);
+      }
+    };
+
+    ws.onclose = () => setTimeout(connect, 2000);
+    ws.onerror = () => ws.close();
+  }
+
+  connect();
+</script>
+</body>
+</html>
