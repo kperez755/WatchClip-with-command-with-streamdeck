@@ -50,7 +50,7 @@ for (const level of ['log', 'warn', 'error']) {
 console.log(`[watchklyp] Logging to ${LOG_PATH}`);
 
 require('dotenv').config({ path: path.join(EXE_DIR, '.env') }); // optional now — fine if the file doesn't exist
-const { exec, execFile } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const tmi = require('tmi.js');
@@ -175,6 +175,103 @@ async function fetchWithTimeout(url, options = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Live update check — compares the local git commit against GitHub's main
+// branch, so a running install can notice when a new version has shipped.
+// Only works when this is an actual git checkout (not a zip download); the
+// status page hides the whole feature otherwise. Nothing here touches your
+// files unless you click "Update now" — checking just reads state.
+//
+// Goes through `git fetch` + rev-parse rather than GitHub's REST API —
+// same github.com the repo already talks to for every pull, no separate
+// API host, no rate limit, and it pre-warms the fetch that "Update now"
+// would need anyway.
+// ---------------------------------------------------------------------------
+const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
+
+let updateState = {
+  supported: false,
+  checking: false,
+  localSha: null,
+  remoteSha: null,
+  remoteMessage: null,
+  updateAvailable: false,
+  dismissedSha: null, // "not now" hides the banner until an even newer commit lands
+  lastCheckedAt: null,
+  lastError: null,
+  applying: false,
+};
+
+function isGitCheckout() {
+  try {
+    return fs.existsSync(path.join(EXE_DIR, '.git'));
+  } catch {
+    return false;
+  }
+}
+
+// Small shell-command helper (goes through cmd.exe on Windows, same as
+// openBrowser above) — used for git/npm here since npm's Windows launcher
+// is a .cmd shim that a shell-less spawn can't resolve directly.
+function runShell(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { cwd: EXE_DIR, timeout: 90000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error((stderr && stderr.trim()) || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+async function checkForUpdates() {
+  updateState.supported = isGitCheckout();
+  if (!updateState.supported) return;
+  updateState.checking = true;
+  try {
+    const localSha = (await runShell('git rev-parse HEAD')).trim();
+    await runShell('git fetch origin main --quiet'); // read-only — updates origin/main, never touches the working tree
+    const remoteSha = (await runShell('git rev-parse origin/main')).trim();
+    const remoteMessage = (await runShell('git log -1 --format=%s origin/main')).trim().slice(0, 120);
+    updateState.localSha = localSha;
+    updateState.remoteSha = remoteSha;
+    updateState.remoteMessage = remoteMessage;
+    updateState.updateAvailable = !!(remoteSha && localSha !== remoteSha && remoteSha !== updateState.dismissedSha);
+    updateState.lastCheckedAt = Date.now();
+    updateState.lastError = null;
+  } catch (err) {
+    updateState.lastError = err.message;
+    console.warn('[watchklyp] Update check failed:', err.message);
+  } finally {
+    updateState.checking = false;
+  }
+}
+
+// Fast-forward only — never merges or overwrites local edits. If someone's
+// hand-modified files in place, this fails loudly instead of clobbering
+// anything, and the error surfaces straight to the status page.
+async function applyUpdate() {
+  if (!isGitCheckout()) {
+    throw new Error("This isn't a git checkout, so it can't auto-update. Re-clone the repo with git to enable this.");
+  }
+  await runShell('git pull --ff-only');
+  await runShell('npm install');
+}
+
+// Respawns a fresh, detached, windowless node process running the just-
+// updated server.js, then exits this one — the new process picks up PORT
+// once this one releases it (see the EADDRINUSE retry on startServer below,
+// which is exactly what makes that handoff reliable instead of a race).
+function scheduleSelfRestart() {
+  console.log('[watchklyp] Restarting to apply update...');
+  const child = spawn(process.execPath, [path.join(EXE_DIR, 'server.js')], {
+    cwd: EXE_DIR,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  setTimeout(() => process.exit(0), 1200);
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +962,11 @@ function renderPage(title, body) {
   }
   .copy-btn:hover { background: var(--card-2); }
   .footer-links { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 13px; }
+  .alert { background: var(--warning-bg); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 20px; }
+  .alert p { color: var(--warning-text); margin: 0 0 12px; font-size: 14px; line-height: 1.5; }
+  .alert .btn-row { display: flex; gap: 8px; }
+  .alert .btn { padding: 8px 14px; font-size: 13.5px; }
+  .alert .alert-note { margin: 10px 0 0; font-size: 12.5px; color: var(--warning-text); }
 </style>
 </head>
 <body>
@@ -958,6 +1060,55 @@ app.get('/status', async (req, res) => {
   const autoStartEnabled = autoStartSupported ? await getAutoStartStatus() : false;
 
   res.type('html').send(renderPage('Status', `
+      ${(updateState.supported && updateState.updateAvailable) ? `
+      <div class="alert" id="update-alert">
+        <p><strong>Update available.</strong> ${escapeHtml(updateState.remoteMessage || 'A new version is on GitHub.')}</p>
+        <div class="btn-row">
+          <button class="btn" id="update-apply-btn" onclick="applyUpdate()">Update now</button>
+          <button class="btn btn-ghost" onclick="dismissUpdate()">Not now</button>
+        </div>
+        <p class="alert-note" id="update-status-note"></p>
+      </div>
+      <script>
+        function applyUpdate() {
+          var btn = document.getElementById('update-apply-btn');
+          var note = document.getElementById('update-status-note');
+          btn.disabled = true;
+          btn.textContent = 'Updating…';
+          fetch('/api/update/apply', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              if (d.ok) {
+                note.textContent = 'Applied — restarting, this page will reload automatically…';
+                waitForRestart();
+              } else {
+                btn.disabled = false;
+                btn.textContent = 'Update now';
+                note.textContent = d.error || 'Update failed.';
+              }
+            })
+            .catch(function () {
+              btn.disabled = false;
+              btn.textContent = 'Update now';
+              note.textContent = 'Something went wrong starting the update.';
+            });
+        }
+        function waitForRestart() {
+          setTimeout(function retry() {
+            fetch('/status', { cache: 'no-store' })
+              .then(function () { window.location.reload(); })
+              .catch(function () { setTimeout(retry, 1500); });
+          }, 2500);
+        }
+        function dismissUpdate() {
+          fetch('/api/update/dismiss', { method: 'POST' }).then(function () {
+            var el = document.getElementById('update-alert');
+            if (el) el.remove();
+          });
+        }
+      </script>
+      ` : ''}
+
       <h1>#${escapeHtml(channelLogin)}</h1>
       ${authBadge}
       ${authBody}
@@ -1061,6 +1212,43 @@ app.post('/api/autostart/disable', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Live update endpoints, driven from the status page banner.
+// ---------------------------------------------------------------------------
+app.get('/api/update/status', (req, res) => {
+  res.json({
+    supported: updateState.supported,
+    checking: updateState.checking,
+    updateAvailable: updateState.updateAvailable,
+    remoteMessage: updateState.remoteMessage,
+    applying: updateState.applying,
+    lastError: updateState.lastError,
+  });
+});
+
+app.post('/api/update/apply', async (req, res) => {
+  if (updateState.applying) {
+    return res.status(409).json({ ok: false, error: 'Already updating — hang tight.' });
+  }
+  updateState.applying = true;
+  try {
+    await applyUpdate();
+    console.log('[watchklyp] Update applied — restarting.');
+    res.json({ ok: true, restarting: true });
+    scheduleSelfRestart();
+  } catch (err) {
+    updateState.applying = false;
+    console.error('[watchklyp] Update failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/update/dismiss', (req, res) => {
+  updateState.dismissedSha = updateState.remoteSha;
+  updateState.updateAvailable = false;
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // Clip-cycling endpoints — meant to be hit by a Stream Deck button paired
 // with switching into/out of a specific OBS scene (e.g. a multi-action:
 // "Switch Scene" + "Website: /api/cycle/start"). /api/cycle/next is called
@@ -1141,16 +1329,45 @@ app.get('/auth/twitch/poll', (req, res) => {
   res.json({ status: deviceAuth.status, error: deviceAuth.error });
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`[watchklyp] Server running at http://localhost:${PORT}`);
-  console.log(`[watchklyp] Browser source: http://localhost:${PORT}/browser-source.html`);
-  console.log(`[watchklyp] Stream Deck trigger URL: http://localhost:${PORT}/api/latest-clip`);
-  console.log(`[watchklyp] Stop URL: http://localhost:${PORT}/api/stop`);
-  console.log(`[watchklyp] Pause/Resume URL: http://localhost:${PORT}/api/pause`);
-  console.log(`[watchklyp] Clip cycling start/stop: http://localhost:${PORT}/api/cycle/start | /api/cycle/stop`);
-  openBrowser(`http://localhost:${PORT}/`);
-  startChatBot();
-});
+// Wrapped so it can retry on EADDRINUSE — most relevant right after an
+// auto-update restart, where the previous process may not have fully freed
+// the port yet by the time the new one starts. Without this, that handoff
+// would be a race that occasionally crashed the freshly-restarted process.
+function startServer(retriesLeft = 10) {
+  const srv = app.listen(PORT, () => {
+    console.log(`[watchklyp] Server running at http://localhost:${PORT}`);
+    console.log(`[watchklyp] Browser source: http://localhost:${PORT}/browser-source.html`);
+    console.log(`[watchklyp] Stream Deck trigger URL: http://localhost:${PORT}/api/latest-clip`);
+    console.log(`[watchklyp] Stop URL: http://localhost:${PORT}/api/stop`);
+    console.log(`[watchklyp] Pause/Resume URL: http://localhost:${PORT}/api/pause`);
+    console.log(`[watchklyp] Clip cycling start/stop: http://localhost:${PORT}/api/cycle/start | /api/cycle/stop`);
+    openBrowser(`http://localhost:${PORT}/`);
+    startChatBot();
+    // Staggered a few seconds after boot so it's not racing the chat bot's
+    // own connection attempt and the token check above for the same local
+    // network path right at process start.
+    setTimeout(checkForUpdates, 5000);
+    setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+  });
+
+  srv.on('upgrade', (req, socket, head) => {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+
+  srv.on('error', (err) => {
+    if (err.code === 'EADDRINUSE' && retriesLeft > 0) {
+      console.warn(`[watchklyp] Port ${PORT} still in use — retrying in 1s (${retriesLeft} left)...`);
+      setTimeout(() => startServer(retriesLeft - 1), 1000);
+    } else {
+      console.error('[watchklyp] Failed to start server:', err.message);
+      process.exit(1);
+    }
+  });
+
+  return srv;
+}
+
+startServer();
 
 // Catch revocation (twitch.tv/settings/connections) while running, not just
 // at next boot — check every 15 minutes and disconnect if it's gone stale.
@@ -1163,7 +1380,3 @@ setInterval(async () => {
     chatClient = null;
   }
 }, 15 * 60 * 1000);
-
-server.on('upgrade', (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-});

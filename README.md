@@ -12,6 +12,7 @@ etc.) that can go down on you.
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Clip cycling](#clip-cycling)
+- [Staying up to date](#staying-up-to-date)
 - [Notes](#notes)
 - [Troubleshooting](#troubleshooting)
 
@@ -33,6 +34,8 @@ etc.) that can go down on you.
 - **Self-hosted auth** — no third-party token generator; authorization
   happens entirely on your own machine and nothing outside your control can
   break it
+- **Update check** — notices when a newer version has shipped and offers to
+  apply it with one click; nothing happens without you approving it
 
 ## How it works
 
@@ -159,6 +162,22 @@ that both switches to that scene and hits `/api/cycle/start` (Website
 action, "Run in Background"), and another that switches away and hits
 `/api/cycle/stop`. The plain **Stop** button also stops cycling, so it works
 as a universal kill switch if something looks wrong.
+
+## Staying up to date
+
+If you set this up with `git clone` (rather than downloading a zip), the
+status page checks GitHub every 30 minutes for a newer commit on `main`. When
+one's found, a banner appears with **Update now** and **Not now**:
+
+- **Update now** runs `git pull` + `npm install`, then restarts itself
+  automatically — the page reloads on its own once it's back up. It only
+  ever fast-forwards (never merges or overwrites anything), so if you've
+  hand-edited files locally it'll fail safely and show the error instead of
+  touching anything.
+- **Not now** dismisses that banner until an even newer commit ships.
+
+Downloaded as a zip instead of cloned with git? This section just doesn't
+appear — grab the latest zip from GitHub manually when you want to update.
 
 ## Notes
 
