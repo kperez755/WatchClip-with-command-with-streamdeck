@@ -179,18 +179,24 @@ async function fetchWithTimeout(url, options = {}) {
 
 // ---------------------------------------------------------------------------
 // Live update check — compares the local git commit against GitHub's main
-// branch once at startup, so a running install can notice when a new
-// version has shipped. Only works when this is an actual git checkout (not
-// a zip download); the status page hides the whole feature otherwise.
-// Nothing here touches your files unless you click "Update now" — checking
-// just reads state. Runs once per boot (not on a timer) — restart the app
-// if you want a fresh check without waiting.
+// branch, so a running install can notice when a new version has shipped.
+// Only works when this is an actual git checkout (not a zip download); the
+// status page hides the whole feature otherwise. Nothing here touches your
+// files unless you click "Update now" — checking just reads state.
+//
+// No background timer — instead, it re-checks whenever someone actually
+// loads the status page, throttled to at most once every few minutes so
+// repeated page views/refreshes don't spam git. That means it stays quiet
+// while nobody's looking instead of polling GitHub on a fixed schedule, but
+// still catches up the moment someone actually checks in on the app.
 //
 // Goes through `git fetch` + rev-parse rather than GitHub's REST API —
 // same github.com the repo already talks to for every pull, no separate
 // API host, no rate limit, and it pre-warms the fetch that "Update now"
 // would need anyway.
 // ---------------------------------------------------------------------------
+const UPDATE_CHECK_MIN_INTERVAL_MS = 2 * 60 * 1000; // don't re-check more than once every 2 minutes
+
 let updateState = {
   supported: false,
   checking: false,
@@ -248,6 +254,16 @@ async function checkForUpdates() {
   } finally {
     updateState.checking = false;
   }
+}
+
+// Called from the status page route on every load — actually re-checks only
+// if it's been a while, so repeatedly refreshing the page doesn't spam git
+// with a fetch every single time. This is the only place checkForUpdates()
+// gets called; there's no separate background timer.
+async function maybeCheckForUpdates() {
+  if (!isGitCheckout() || updateState.checking) return;
+  const stale = !updateState.lastCheckedAt || Date.now() - updateState.lastCheckedAt > UPDATE_CHECK_MIN_INTERVAL_MS;
+  if (stale) await checkForUpdates();
 }
 
 // Fast-forward only — never merges or overwrites local edits. If someone's
@@ -1098,6 +1114,9 @@ app.post('/api/setup', (req, res) => {
 app.get('/status', async (req, res) => {
   if (!channelLogin) return res.redirect('/');
 
+  // Throttled re-check of GitHub — see maybeCheckForUpdates() above.
+  await maybeCheckForUpdates();
+
   // Live-checked against Twitch, not just "does token.json exist on disk" —
   // catches the case where access was revoked from twitch.tv/settings/connections.
   const token = await getValidToken();
@@ -1438,11 +1457,9 @@ function startServer(retriesLeft = 10) {
     console.log(`[watchklyp] Clip cycling start/stop: http://localhost:${PORT}/api/cycle/start | /api/cycle/stop`);
     openBrowser(`http://localhost:${PORT}/`);
     startChatBot();
-    // Checked once per boot, staggered a few seconds so it's not racing the
-    // chat bot's own connection attempt and the token check above for the
-    // same local network path right at process start. Restart the app for
-    // a fresh check rather than waiting on a timer.
-    setTimeout(checkForUpdates, 5000);
+    // No boot-time update check here — the auto-opened browser lands on
+    // /status right after this anyway, which triggers the first check
+    // itself (see maybeCheckForUpdates above).
   });
 
   srv.on('upgrade', (req, socket, head) => {

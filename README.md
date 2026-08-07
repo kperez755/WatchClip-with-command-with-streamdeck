@@ -167,9 +167,13 @@ as a universal kill switch if something looks wrong.
 ## Staying up to date
 
 If you set this up with `git clone` (rather than downloading a zip), the
-status page checks GitHub once, a few seconds after the server starts, for a
-newer commit on `main` (not on a timer — restart the app for a fresh check).
-When one's found, a banner appears with **Update now** and **Not now**:
+status page checks GitHub for a newer commit on `main` every time you load
+it — no background timer, so it stays quiet while nobody's looking, but
+catches up the moment you actually check in (throttled to at most once
+every couple minutes, so refreshing the page repeatedly doesn't spam
+GitHub). The current commit you're running is shown at the bottom of the
+page too, so you can always tell at a glance. When a newer commit is found,
+a banner appears with **Update now** and **Not now**:
 
 - **Update now** runs `git pull` + `npm install`, then restarts itself
   automatically — the page reloads on its own once it's back up. It only
