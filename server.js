@@ -179,18 +179,18 @@ async function fetchWithTimeout(url, options = {}) {
 
 // ---------------------------------------------------------------------------
 // Live update check — compares the local git commit against GitHub's main
-// branch, so a running install can notice when a new version has shipped.
-// Only works when this is an actual git checkout (not a zip download); the
-// status page hides the whole feature otherwise. Nothing here touches your
-// files unless you click "Update now" — checking just reads state.
+// branch once at startup, so a running install can notice when a new
+// version has shipped. Only works when this is an actual git checkout (not
+// a zip download); the status page hides the whole feature otherwise.
+// Nothing here touches your files unless you click "Update now" — checking
+// just reads state. Runs once per boot (not on a timer) — restart the app
+// if you want a fresh check without waiting.
 //
 // Goes through `git fetch` + rev-parse rather than GitHub's REST API —
 // same github.com the repo already talks to for every pull, no separate
 // API host, no rate limit, and it pre-warms the fetch that "Update now"
 // would need anyway.
 // ---------------------------------------------------------------------------
-const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
-
 let updateState = {
   supported: false,
   checking: false,
@@ -198,7 +198,10 @@ let updateState = {
   remoteSha: null,
   remoteMessage: null,
   updateAvailable: false,
-  dismissedSha: null, // "not now" hides the banner until an even newer commit lands
+  // "Not now" doesn't make the notice disappear — it just shrinks down to a
+  // small persistent "Out of date" strip instead of staying dismissed
+  // outright, so it's not easy to forget about.
+  dismissed: false,
   lastCheckedAt: null,
   lastError: null,
   applying: false,
@@ -236,7 +239,7 @@ async function checkForUpdates() {
     updateState.localSha = localSha;
     updateState.remoteSha = remoteSha;
     updateState.remoteMessage = remoteMessage;
-    updateState.updateAvailable = !!(remoteSha && localSha !== remoteSha && remoteSha !== updateState.dismissedSha);
+    updateState.updateAvailable = !!(remoteSha && localSha !== remoteSha);
     updateState.lastCheckedAt = Date.now();
     updateState.lastError = null;
   } catch (err) {
@@ -1060,7 +1063,7 @@ app.get('/status', async (req, res) => {
   const autoStartEnabled = autoStartSupported ? await getAutoStartStatus() : false;
 
   res.type('html').send(renderPage('Status', `
-      ${(updateState.supported && updateState.updateAvailable) ? `
+      ${(updateState.supported && updateState.updateAvailable && !updateState.dismissed) ? `
       <div class="alert" id="update-alert">
         <p><strong>Update available.</strong> ${escapeHtml(updateState.remoteMessage || 'A new version is on GitHub.')}</p>
         <div class="btn-row">
@@ -1069,10 +1072,22 @@ app.get('/status', async (req, res) => {
         </div>
         <p class="alert-note" id="update-status-note"></p>
       </div>
+      ` : ''}
+      ${(updateState.supported && updateState.updateAvailable && updateState.dismissed) ? `
+      <div class="row" id="update-alert">
+        <div>
+          <div class="row-label">Out of date</div>
+          <div class="row-note" id="update-status-note">${escapeHtml(updateState.remoteMessage || 'A new version is available on GitHub.')}</div>
+        </div>
+        <button class="copy-btn" id="update-apply-btn" onclick="applyUpdate()">Update</button>
+      </div>
+      ` : ''}
+      ${(updateState.supported && updateState.updateAvailable) ? `
       <script>
         function applyUpdate() {
           var btn = document.getElementById('update-apply-btn');
           var note = document.getElementById('update-status-note');
+          var originalLabel = btn.textContent;
           btn.disabled = true;
           btn.textContent = 'Updating…';
           fetch('/api/update/apply', { method: 'POST' })
@@ -1083,13 +1098,13 @@ app.get('/status', async (req, res) => {
                 waitForRestart();
               } else {
                 btn.disabled = false;
-                btn.textContent = 'Update now';
+                btn.textContent = originalLabel;
                 note.textContent = d.error || 'Update failed.';
               }
             })
             .catch(function () {
               btn.disabled = false;
-              btn.textContent = 'Update now';
+              btn.textContent = originalLabel;
               note.textContent = 'Something went wrong starting the update.';
             });
         }
@@ -1102,8 +1117,7 @@ app.get('/status', async (req, res) => {
         }
         function dismissUpdate() {
           fetch('/api/update/dismiss', { method: 'POST' }).then(function () {
-            var el = document.getElementById('update-alert');
-            if (el) el.remove();
+            window.location.reload();
           });
         }
       </script>
@@ -1219,6 +1233,7 @@ app.get('/api/update/status', (req, res) => {
     supported: updateState.supported,
     checking: updateState.checking,
     updateAvailable: updateState.updateAvailable,
+    dismissed: updateState.dismissed,
     remoteMessage: updateState.remoteMessage,
     applying: updateState.applying,
     lastError: updateState.lastError,
@@ -1243,8 +1258,9 @@ app.post('/api/update/apply', async (req, res) => {
 });
 
 app.post('/api/update/dismiss', (req, res) => {
-  updateState.dismissedSha = updateState.remoteSha;
-  updateState.updateAvailable = false;
+  // Doesn't clear updateAvailable — just shrinks the status-page notice down
+  // to a small persistent "Out of date" strip instead of hiding it outright.
+  updateState.dismissed = true;
   res.json({ ok: true });
 });
 
@@ -1343,11 +1359,11 @@ function startServer(retriesLeft = 10) {
     console.log(`[watchklyp] Clip cycling start/stop: http://localhost:${PORT}/api/cycle/start | /api/cycle/stop`);
     openBrowser(`http://localhost:${PORT}/`);
     startChatBot();
-    // Staggered a few seconds after boot so it's not racing the chat bot's
-    // own connection attempt and the token check above for the same local
-    // network path right at process start.
+    // Checked once per boot, staggered a few seconds so it's not racing the
+    // chat bot's own connection attempt and the token check above for the
+    // same local network path right at process start. Restart the app for
+    // a fresh check rather than waiting on a timer.
     setTimeout(checkForUpdates, 5000);
-    setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
   });
 
   srv.on('upgrade', (req, socket, head) => {

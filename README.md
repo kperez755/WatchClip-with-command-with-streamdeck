@@ -166,15 +166,18 @@ as a universal kill switch if something looks wrong.
 ## Staying up to date
 
 If you set this up with `git clone` (rather than downloading a zip), the
-status page checks GitHub every 30 minutes for a newer commit on `main`. When
-one's found, a banner appears with **Update now** and **Not now**:
+status page checks GitHub once, a few seconds after the server starts, for a
+newer commit on `main` (not on a timer — restart the app for a fresh check).
+When one's found, a banner appears with **Update now** and **Not now**:
 
 - **Update now** runs `git pull` + `npm install`, then restarts itself
   automatically — the page reloads on its own once it's back up. It only
   ever fast-forwards (never merges or overwrites anything), so if you've
   hand-edited files locally it'll fail safely and show the error instead of
   touching anything.
-- **Not now** dismisses that banner until an even newer commit ships.
+- **Not now** doesn't make the notice go away — it just shrinks down to a
+  small **Out of date** line at the top of the page that stays there (with
+  its own **Update** button) until you actually update.
 
 Downloaded as a zip instead of cloned with git? This section just doesn't
 appear — grab the latest zip from GitHub manually when you want to update.
