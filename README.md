@@ -116,7 +116,7 @@ own button:
 
 1. In the Stream Deck app, drag the **Website** action (under System) onto a
    button.
-2. URL: one of the three below.
+2. URL: one of the four below.
 3. Check **"Run in Background"** — this is the key setting; it fires the
    request without popping open a browser window.
 4. Give it a matching icon and title.
@@ -126,6 +126,7 @@ own button:
 | Watch Clip | `http://localhost:3939/api/latest-clip` | Same as typing `!watch` in chat |
 | Stop | `http://localhost:3939/api/stop` | Immediately hides whatever's playing (also stops clip cycling) |
 | Pause/Resume | `http://localhost:3939/api/pause` | Toggles playback — only works during chrome-less playback; does nothing during the plain iframe embed, since Twitch doesn't expose any external control over it |
+| Create Clip | `http://localhost:3939/api/clip/create` | Clips your own live stream right now, same as Twitch's own clip button — only works while you're live, and needs one re-authorization if you set WatchKlyp up before this feature existed. Posts "Clip created: ... link" in chat once it's ready |
 
 All of these URLs are also listed on the status page (`http://localhost:3939/status`) with one-click copy buttons.
 

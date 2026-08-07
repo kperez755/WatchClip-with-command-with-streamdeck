@@ -425,6 +425,66 @@ async function fetchOwnClips(limit = 20) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Create Clip — the same thing Twitch's own "Clip" button does, triggered
+// from a Stream Deck button instead. Only works while you're actually live
+// (Twitch has nothing to clip from an offline channel), and needs the
+// clips:edit scope, which is separate from channel:manage:clips (the one
+// used for chrome-less playback) — installs from before this feature won't
+// have it until they re-authorize once.
+//
+// Twitch hands back a clip ID immediately but the clip itself takes a few
+// seconds to actually process; this doesn't wait around for that; it just
+// creates it. The clip shows up in your normal Twitch clips list like any
+// other, same as pressing the native button would.
+// ---------------------------------------------------------------------------
+async function createClip() {
+  const token = await getValidToken();
+  if (!token) throw new Error('Not authorized — visit /auth/twitch.');
+  if (!token.scopes || !token.scopes.includes('clips:edit')) {
+    throw new Error('Missing clip-creation permission — re-authorize at /auth/twitch to grant it.');
+  }
+  const broadcasterId = await getOwnBroadcasterId();
+  if (!broadcasterId) throw new Error("Couldn't resolve your channel — check the channel name on the setup page.");
+
+  const res = await fetchWithTimeout(
+    `https://api.twitch.tv/helix/clips?${new URLSearchParams({ broadcaster_id: broadcasterId })}`,
+    { method: 'POST', headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` } }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data.message || '').toLowerCase();
+    if (res.status === 404 || msg.includes('offline') || msg.includes('not live')) {
+      throw new Error("You're not live right now — nothing to clip.");
+    }
+    throw new Error(data.message || `Twitch returned ${res.status}`);
+  }
+  const clip = (data.data || [])[0];
+  if (!clip) throw new Error("Twitch didn't return a clip.");
+  return { id: clip.id, editUrl: clip.edit_url };
+}
+
+// Posts a "Clip created" message in chat once the clip has actually
+// finished processing (Create Clip hands back an ID instantly, but the
+// clip itself takes a few seconds to become fetchable — this is also the
+// only way to get its title, since Twitch's API has no way to set a custom
+// one at creation; only the streamer can rename it by hand via edit_url).
+// Fire-and-forget from the route so the Stream Deck button itself doesn't
+// sit waiting on this.
+async function announceClipInChat(clipId, clipUrl) {
+  if (!chatClient || !channelLogin) return;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const clip = await getClipById(clipId).catch(() => null);
+    if (clip && clip.title) {
+      chatClient.say(channelLogin, `Clip created: "${clip.title}" — ${clipUrl}`).catch(() => {});
+      return;
+    }
+  }
+  // Still not resolved after ~10s — post the link anyway rather than staying silent.
+  chatClient.say(channelLogin, `Clip created: ${clipUrl}`).catch(() => {});
+}
+
 function shuffle(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -691,7 +751,7 @@ async function refreshUserToken(refreshToken) {
 // twitch.tv (in any browser, even their phone), and poll in the background
 // until they do. Docs: https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#device-code-grant-flow
 // ---------------------------------------------------------------------------
-const AUTH_SCOPES = 'chat:read chat:edit channel:manage:clips';
+const AUTH_SCOPES = 'chat:read chat:edit channel:manage:clips clips:edit';
 
 // Single in-flight auth attempt at a time — fine for a local single-user app.
 // { device_code, user_code, verification_uri, expiresAt, interval, status, error }
@@ -1041,7 +1101,8 @@ app.get('/status', async (req, res) => {
   // Live-checked against Twitch, not just "does token.json exist on disk" —
   // catches the case where access was revoked from twitch.tv/settings/connections.
   const token = await getValidToken();
-  const hasClipScope = token && token.scopes && token.scopes.includes('channel:manage:clips');
+  const hasDownloadScope = token && token.scopes && token.scopes.includes('channel:manage:clips');
+  const hasCreateScope = token && token.scopes && token.scopes.includes('clips:edit');
 
   let authBadge, authBody;
   if (!token) {
@@ -1049,12 +1110,15 @@ app.get('/status', async (req, res) => {
     authBody = `<p>Connect your Twitch account to start the chat bot and
       enable chrome-less playback.</p>
       <a class="btn" href="/auth/twitch">Authorize with Twitch →</a>`;
-  } else if (hasClipScope) {
+  } else if (hasDownloadScope && hasCreateScope) {
     authBadge = `<span class="badge badge-success"><span class="dot"></span>Authorized</span>`;
-    authBody = `<p>Chrome-less playback is enabled.</p>`;
+    authBody = `<p>Chrome-less playback and clip creation are enabled.</p>`;
   } else {
+    const missing = [];
+    if (!hasDownloadScope) missing.push('clip-download');
+    if (!hasCreateScope) missing.push('clip-creation');
     authBadge = `<span class="badge badge-warning"><span class="dot"></span>Missing permission</span>`;
-    authBody = `<p>Authorized, but missing the clip-download permission.</p>
+    authBody = `<p>Authorized, but missing the ${missing.join(' and ')} permission${missing.length > 1 ? 's' : ''}.</p>
       <a class="btn btn-ghost" href="/auth/twitch">Re-authorize →</a>`;
   }
 
@@ -1134,6 +1198,7 @@ app.get('/status', async (req, res) => {
       ${urlRow('Watch Clip', `${base}/api/latest-clip`, 'Same as typing !watch in chat')}
       ${urlRow('Stop', `${base}/api/stop`, 'Also stops clip cycling')}
       ${urlRow('Pause / Resume', `${base}/api/pause`, 'Only works during chrome-less playback')}
+      ${urlRow('Create Clip', `${base}/api/clip/create`, 'Clips your own live stream right now — only works while you’re live')}
 
       <h2>Clip Cycling</h2>
       ${urlRow('Start cycling', `${base}/api/cycle/start`, 'Pair with switching into a scene')}
@@ -1194,6 +1259,19 @@ app.get('/api/stop', (req, res) => {
 app.get('/api/pause', (req, res) => {
   broadcast({ type: 'control', action: 'toggle-pause' });
   res.json({ ok: true });
+});
+
+app.get('/api/clip/create', async (req, res) => {
+  try {
+    const clip = await createClip();
+    const clipUrl = `https://clips.twitch.tv/${clip.id}`;
+    console.log(`[watchklyp] Clip created: ${clip.id}`);
+    announceClipInChat(clip.id, clipUrl); // fire-and-forget — don't hold up the response for it
+    res.json({ ok: true, id: clip.id, url: clipUrl, editUrl: clip.editUrl });
+  } catch (err) {
+    console.warn('[watchklyp] Failed to create clip:', err.message);
+    res.json({ ok: false, message: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
