@@ -105,6 +105,27 @@ function openBrowser(url) {
 }
 
 // ---------------------------------------------------------------------------
+// Every outbound call to Twitch below goes through this instead of bare
+// fetch(). None of them had a timeout before, which meant a single slow or
+// stalled response from Twitch (their clip-download endpoint is beta and can
+// be flaky) would hang that request forever with no error and no recovery —
+// exactly what caused clip playback to silently "freeze" and stop responding
+// to further triggers. A hung promise never rejects on its own, so no amount
+// of try/catch fixes it; only an explicit abort does.
+// ---------------------------------------------------------------------------
+const FETCH_TIMEOUT_MS = 8000;
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Get Clips Download (official beta API) — gives us the raw clip video file
 // so the browser source can play it with a plain, chrome-less <video> tag
 // instead of Twitch's iframe player (no controls/branding, full JS control
@@ -123,7 +144,7 @@ async function getClipDownloadUrl(clipId, broadcasterId) {
       editor_id: token.userId,
       clip_id: clipId,
     });
-    const res = await fetch(`https://api.twitch.tv/helix/clips/downloads?${params}`, {
+    const res = await fetchWithTimeout(`https://api.twitch.tv/helix/clips/downloads?${params}`, {
       headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
     });
     if (!res.ok) {
@@ -195,12 +216,17 @@ function isModOrBroadcaster(tags) {
 async function getClipById(clipId) {
   const token = await getValidToken();
   if (!token) return null;
-  const res = await fetch(`https://api.twitch.tv/helix/clips?id=${encodeURIComponent(clipId)}`, {
-    headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  return (data.data || [])[0] || null;
+  try {
+    const res = await fetchWithTimeout(`https://api.twitch.tv/helix/clips?id=${encodeURIComponent(clipId)}`, {
+      headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data.data || [])[0] || null;
+  } catch (err) {
+    console.warn('[watchklyp] Get Clips lookup failed:', err.message);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,13 +240,18 @@ async function getOwnBroadcasterId() {
   if (cachedBroadcasterId) return cachedBroadcasterId;
   const token = await getValidToken();
   if (!token) return null;
-  const res = await fetch(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(channelLogin)}`, {
-    headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  cachedBroadcasterId = (data.data || [])[0]?.id || null;
-  return cachedBroadcasterId;
+  try {
+    const res = await fetchWithTimeout(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(channelLogin)}`, {
+      headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    cachedBroadcasterId = (data.data || [])[0]?.id || null;
+    return cachedBroadcasterId;
+  } catch (err) {
+    console.warn('[watchklyp] Get Users lookup failed:', err.message);
+    return null;
+  }
 }
 
 async function fetchOwnClips(limit = 20) {
@@ -228,13 +259,18 @@ async function fetchOwnClips(limit = 20) {
   if (!broadcasterId) return [];
   const token = await getValidToken();
   if (!token) return [];
-  const params = new URLSearchParams({ broadcaster_id: broadcasterId, first: String(limit) });
-  const res = await fetch(`https://api.twitch.tv/helix/clips?${params}`, {
-    headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
-  });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.data || [];
+  try {
+    const params = new URLSearchParams({ broadcaster_id: broadcasterId, first: String(limit) });
+    const res = await fetchWithTimeout(`https://api.twitch.tv/helix/clips?${params}`, {
+      headers: { 'Client-Id': TWITCH_CLIENT_ID, Authorization: `Bearer ${token.access_token}` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.data || [];
+  } catch (err) {
+    console.warn('[watchklyp] Fetch own clips failed:', err.message);
+    return [];
+  }
 }
 
 function shuffle(arr) {
@@ -353,11 +389,20 @@ async function advanceCycle() {
   cycling.generation += 1;
   const myGeneration = cycling.generation;
 
-  let videoUrl = await getClipDownloadUrl(clip.id, clip.broadcaster_id);
-  let videoSource = videoUrl ? 'official' : null;
-  if (!videoUrl) {
-    videoUrl = guessClipVideoUrl(clip);
-    if (videoUrl) videoSource = 'unofficial-guess';
+  // Wrapped defensively so cycling can never permanently die mid-run — any
+  // unexpected error here just means this one clip falls back to the iframe
+  // embed instead of chrome-less video; the cycle itself keeps moving.
+  let videoUrl = null;
+  let videoSource = null;
+  try {
+    videoUrl = await getClipDownloadUrl(clip.id, clip.broadcaster_id);
+    videoSource = videoUrl ? 'official' : null;
+    if (!videoUrl) {
+      videoUrl = guessClipVideoUrl(clip);
+      if (videoUrl) videoSource = 'unofficial-guess';
+    }
+  } catch (err) {
+    console.error('[watchklyp] (cycle) Error resolving video, falling back to embed:', err.message);
   }
   console.log(
     `[watchklyp] (cycle) "${clip.title}" (${clip.duration}s) — video: ${videoUrl ? videoSource : 'no, iframe fallback'}`
@@ -411,7 +456,7 @@ function clearToken() {
 // actually granted, since Twitch can silently keep old scopes on reuse.
 async function validateToken(accessToken) {
   try {
-    const res = await fetch('https://id.twitch.tv/oauth2/validate', {
+    const res = await fetchWithTimeout('https://id.twitch.tv/oauth2/validate', {
       headers: { Authorization: `OAuth ${accessToken}` },
     });
     if (!res.ok) return { valid: false, scopes: [], userId: null };
@@ -426,22 +471,46 @@ async function validateToken(accessToken) {
 
 // Loads token.json AND checks it's still actually valid with Twitch. If it's
 // been revoked, clears the stale local file so state reflects reality.
+//
+// A single trigger (chat command or Stream Deck button) calls this from more
+// than one place (e.g. getClipById + getClipDownloadUrl), which used to mean
+// two full network round-trips to Twitch's /oauth2/validate per click before
+// any actual clip data was fetched. That's cut down here with a short TTL
+// cache — same access token seen again within the window skips the network
+// call entirely. It self-invalidates on refresh/re-auth since a new token
+// string won't match the cached one.
+let tokenValidationCache = { token: null, result: null, checkedAt: 0 };
+const TOKEN_VALIDATION_TTL_MS = 60_000;
+
 async function getValidToken() {
   const token = loadToken();
   if (!token) return null;
+
+  const now = Date.now();
+  if (
+    tokenValidationCache.token === token.access_token &&
+    now - tokenValidationCache.checkedAt < TOKEN_VALIDATION_TTL_MS
+  ) {
+    return { ...token, ...tokenValidationCache.result };
+  }
+
   const { valid, scopes, userId, unknown } = await validateToken(token.access_token);
   if (!valid) {
     console.warn('[watchklyp] Stored token was revoked/expired — clearing it. Re-authorize at /auth/twitch.');
     clearToken();
+    tokenValidationCache = { token: null, result: null, checkedAt: 0 };
     return null;
   }
-  return { ...token, scopes: unknown ? null : scopes, userId };
+
+  const result = { scopes: unknown ? null : scopes, userId };
+  tokenValidationCache = { token: token.access_token, result, checkedAt: now };
+  return { ...token, ...result };
 }
 
 async function refreshUserToken(refreshToken) {
   // Public clients refresh without a secret too — just client_id + the
   // refresh token itself authenticates the request.
-  const res = await fetch('https://id.twitch.tv/oauth2/token', {
+  const res = await fetchWithTimeout('https://id.twitch.tv/oauth2/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -480,7 +549,7 @@ async function startDeviceAuth() {
   const form = new FormData();
   form.append('client_id', TWITCH_CLIENT_ID);
   form.append('scopes', AUTH_SCOPES);
-  const res = await fetch('https://id.twitch.tv/oauth2/device', { method: 'POST', body: form });
+  const res = await fetchWithTimeout('https://id.twitch.tv/oauth2/device', { method: 'POST', body: form });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.device_code) {
     throw new Error(data.message || `Failed to start device auth (${res.status})`);
@@ -514,7 +583,7 @@ async function pollDeviceAuth(session) {
     form.append('scopes', AUTH_SCOPES);
     form.append('device_code', session.device_code);
     form.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
-    const res = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', body: form });
+    const res = await fetchWithTimeout('https://id.twitch.tv/oauth2/token', { method: 'POST', body: form });
     const data = await res.json().catch(() => ({}));
 
     if (res.ok && data.access_token) {
@@ -548,9 +617,12 @@ async function pollDeviceAuth(session) {
     session.error = data.message || `Unexpected response (${res.status})`;
     console.error('[watchklyp] Device auth error:', session.error);
   } catch (err) {
-    session.status = 'error';
-    session.error = err.message;
-    console.error('[watchklyp] Device auth poll failed:', err.message);
+    // A single stalled/failed poll (including a timeout) shouldn't kill the
+    // whole flow — the user may still be mid-approval on Twitch's side. Just
+    // retry; the expiresAt check at the top of this function is what
+    // eventually gives up if it really has gone stale.
+    console.warn('[watchklyp] Device auth poll network error, retrying:', err.message);
+    setTimeout(() => pollDeviceAuth(session), session.interval);
   }
 }
 
