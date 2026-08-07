@@ -1242,6 +1242,7 @@ app.get('/status', async (req, res) => {
         <a href="/">Change channel</a> &nbsp;·&nbsp;
         <a href="https://www.twitch.tv/settings/connections" target="_blank" rel="noopener">Manage access on Twitch</a>
       </div>
+      ${(updateState.supported && updateState.localSha) ? `<p style="margin:10px 0 0;font-size:11.5px;color:var(--muted);">Running ${escapeHtml(updateState.localSha.slice(0, 7))}</p>` : ''}
   `));
 });
 
