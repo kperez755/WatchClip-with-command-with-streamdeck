@@ -218,7 +218,7 @@ appear — grab the latest zip from GitHub manually when you want to update.
   shortcut needed. Click **Disable** there any time to turn it back off.
   Windows-only; the toggle doesn't appear on other platforms.
 - **One port, no certs**: everything — browser source, Stream Deck
-  endpoints, setup, and authorization — runs on plain http on `3939`. There's
+  endpoints, setup, and authorization — runs on plain HTTP on `3939`. There's
   no separate HTTPS listener or self-signed cert to click through, since
   Twitch's device code flow doesn't use a redirect URL at all.
 
