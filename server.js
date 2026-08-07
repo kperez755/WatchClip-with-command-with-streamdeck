@@ -50,7 +50,7 @@ for (const level of ['log', 'warn', 'error']) {
 console.log(`[watchklyp] Logging to ${LOG_PATH}`);
 
 require('dotenv').config({ path: path.join(EXE_DIR, '.env') }); // optional now — fine if the file doesn't exist
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const tmi = require('tmi.js');
@@ -101,6 +101,58 @@ function openBrowser(url) {
     `xdg-open "${url}"`;
   exec(cmd, (err) => {
     if (err) console.warn('[watchklyp] Could not auto-open browser:', err.message);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Auto-start on Windows login — flips a per-user registry value under
+// HKCU\...\Run, so no admin rights are needed. Points at start.bat itself
+// (launched minimized), which already handles first-run npm install, so
+// autostart works identically to double-clicking it by hand. This is
+// Windows-only; other platforms just report unsupported and the status page
+// hides the toggle.
+// ---------------------------------------------------------------------------
+const AUTOSTART_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const AUTOSTART_VALUE_NAME = 'WatchKlyp';
+
+function isAutoStartSupported() {
+  return process.platform === 'win32';
+}
+
+function getAutoStartStatus() {
+  return new Promise((resolve) => {
+    if (!isAutoStartSupported()) return resolve(false);
+    execFile('reg', ['query', AUTOSTART_REG_KEY, '/v', AUTOSTART_VALUE_NAME], (err) => {
+      resolve(!err); // reg query exits non-zero if the value doesn't exist
+    });
+  });
+}
+
+function setAutoStart(enabled) {
+  return new Promise((resolve, reject) => {
+    if (!isAutoStartSupported()) {
+      return reject(new Error('Auto-start is only supported on Windows.'));
+    }
+    if (!enabled) {
+      execFile('reg', ['delete', AUTOSTART_REG_KEY, '/v', AUTOSTART_VALUE_NAME, '/f'], (err) => {
+        // Exits non-zero if the value was already gone — that's fine, the
+        // end state (not registered) is what we wanted either way.
+        resolve();
+      });
+      return;
+    }
+    const startBatPath = path.join(EXE_DIR, 'start.bat');
+    // Launched via `start ... /min` so login doesn't pop a visible console
+    // window the way manually double-clicking start.bat does.
+    const command = `cmd /c start "" /min "${startBatPath}"`;
+    execFile(
+      'reg',
+      ['add', AUTOSTART_REG_KEY, '/v', AUTOSTART_VALUE_NAME, '/t', 'REG_SZ', '/d', command, '/f'],
+      (err) => {
+        if (err) return reject(err);
+        resolve();
+      }
+    );
   });
 }
 
@@ -902,6 +954,8 @@ app.get('/status', async (req, res) => {
   }
 
   const base = `http://localhost:${PORT}`;
+  const autoStartSupported = isAutoStartSupported();
+  const autoStartEnabled = autoStartSupported ? await getAutoStartStatus() : false;
 
   res.type('html').send(renderPage('Status', `
       <h1>#${escapeHtml(channelLogin)}</h1>
@@ -919,6 +973,40 @@ app.get('/status', async (req, res) => {
       <h2>Clip Cycling</h2>
       ${urlRow('Start cycling', `${base}/api/cycle/start`, 'Pair with switching into a scene')}
       ${urlRow('Stop cycling', `${base}/api/cycle/stop`, 'Pair with switching out of a scene')}
+
+      ${autoStartSupported ? `
+      <h2>Startup</h2>
+      <div class="row" id="autostart-row">
+        <div>
+          <div class="row-label">Launch WatchKlyp when Windows starts</div>
+          <div class="row-note" id="autostart-note">${autoStartEnabled ? 'Enabled — starts automatically at login' : 'Off — start it yourself each time'}</div>
+        </div>
+        <button class="copy-btn" id="autostart-btn" onclick="toggleAutoStart()">${autoStartEnabled ? 'Disable' : 'Enable'}</button>
+      </div>
+      <script>
+        function toggleAutoStart() {
+          const btn = document.getElementById('autostart-btn');
+          const note = document.getElementById('autostart-note');
+          const enabling = btn.textContent.trim() === 'Enable';
+          btn.disabled = true;
+          fetch('/api/autostart/' + (enabling ? 'enable' : 'disable'), { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              btn.disabled = false;
+              if (d.ok) {
+                btn.textContent = d.enabled ? 'Disable' : 'Enable';
+                note.textContent = d.enabled ? 'Enabled — starts automatically at login' : 'Off — start it yourself each time';
+              } else {
+                note.textContent = d.error || 'Something went wrong.';
+              }
+            })
+            .catch(function () {
+              btn.disabled = false;
+              note.textContent = 'Something went wrong — is the server still running?';
+            });
+        }
+      </script>
+      ` : ''}
 
       <div class="footer-links">
         <a href="/">Change channel</a> &nbsp;·&nbsp;
@@ -941,6 +1029,35 @@ app.get('/api/stop', (req, res) => {
 app.get('/api/pause', (req, res) => {
   broadcast({ type: 'control', action: 'toggle-pause' });
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-start toggle, driven from the status page — see setAutoStart() above.
+// ---------------------------------------------------------------------------
+app.get('/api/autostart/status', async (req, res) => {
+  res.json({ supported: isAutoStartSupported(), enabled: await getAutoStartStatus() });
+});
+
+app.post('/api/autostart/enable', async (req, res) => {
+  try {
+    await setAutoStart(true);
+    console.log('[watchklyp] Auto-start enabled — WatchKlyp will launch at Windows login.');
+    res.json({ ok: true, enabled: true });
+  } catch (err) {
+    console.error('[watchklyp] Failed to enable auto-start:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/autostart/disable', async (req, res) => {
+  try {
+    await setAutoStart(false);
+    console.log('[watchklyp] Auto-start disabled.');
+    res.json({ ok: true, enabled: false });
+  } catch (err) {
+    console.error('[watchklyp] Failed to disable auto-start:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------

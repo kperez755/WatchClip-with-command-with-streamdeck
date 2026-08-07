@@ -185,9 +185,11 @@ as a universal kill switch if something looks wrong.
   browser source.
 - **Multiple browser sources**: every open browser-source page updates
   together, since the server broadcasts to all of them.
-- **Run at Windows startup (optional)**: press `Win+R`, type `shell:startup`,
-  and drop a shortcut to `start.bat` in that folder so it launches whenever
-  you log in.
+- **Launch at Windows startup (optional)**: on the status page, there's an
+  **Enable** button under **Startup** that registers WatchKlyp to launch
+  automatically (minimized) whenever you log into Windows — no manual
+  shortcut needed. Click **Disable** there any time to turn it back off.
+  Windows-only; the toggle doesn't appear on other platforms.
 - **One port, no certs**: everything — browser source, Stream Deck
   endpoints, setup, and authorization — runs on plain http on `3939`. There's
   no separate HTTPS listener or self-signed cert to click through, since
